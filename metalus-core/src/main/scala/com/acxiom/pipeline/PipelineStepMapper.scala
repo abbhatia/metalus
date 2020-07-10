@@ -87,10 +87,17 @@ trait PipelineStepMapper {
     * @return
     */
   def mapByType(value: Option[String], parameter: Parameter): Any = {
-    parameter.`type`.getOrElse("") match {
-      case "integer" => value.getOrElse("0").toInt
-      case "boolean" => value.getOrElse("false") == "true"
-      case _ => mapByValue(value, parameter)
+    if(value.isDefined) {
+      parameter.`type`.getOrElse("").toLowerCase match {
+        case "integer" => value.get.toInt
+        case "long" => value.get.toLong
+        case "float" => value.get.toFloat
+        case "double" => value.get.toDouble
+        case "boolean" => value.get.toBoolean
+        case _ => mapByValue(value, parameter)
+      }
+    } else {
+      mapByValue(value, parameter)
     }
   }
 
@@ -163,6 +170,7 @@ trait PipelineStepMapper {
     * @return An expanded list
     */
   private def handleListParameter(list: List[_], parameter: Parameter, pipelineContext: PipelineContext): Option[Any] = {
+    val dropNone = pipelineContext.getGlobalAs[Boolean]("dropNoneFromLists").getOrElse(true)
     Some(if (parameter.className.isDefined && parameter.className.get.nonEmpty) {
       implicit val formats: Formats = DefaultFormats
       list.map(value =>
@@ -170,9 +178,13 @@ trait PipelineStepMapper {
     } else if (list.head.isInstanceOf[Map[_, _]]) {
       list.map(value => mapEmbeddedVariables(value.asInstanceOf[Map[String, Any]], pipelineContext))
     } else if(list.nonEmpty) {
-      list.map {
-        case s: String if containsSpecialCharacters(s) => returnBestValue(s, Parameter(), pipelineContext)
-        case a: Any => a
+      list.flatMap {
+        case s: String if containsSpecialCharacters(s) =>
+          (dropNone, getBestValue(s.split("\\|\\|"), Parameter(), pipelineContext)) match {
+            case (false, None) => Some(null) // scalastyle:off null
+            case (_, v) => v
+          }
+        case a: Any => Some(a)
       }
     } else {
       list
@@ -180,7 +192,7 @@ trait PipelineStepMapper {
   }
 
   /**
-    * Iterates a map prior to converting to a case class and substitutes values marked with special characters: @,#,$,!
+    * Iterates a map prior to converting to a case class and substitutes values marked with special characters: @,#,$,!,&,?
     * @param classMap The object map
     * @param pipelineContext The pipelineContext
     * @return A map with substituted values
@@ -192,13 +204,14 @@ trait PipelineStepMapper {
           map + (entry._1 -> returnBestValue(s, Parameter(), pipelineContext))
         case m:  Map[_, _] =>
           map + (entry._1 -> mapEmbeddedVariables(m.asInstanceOf[Map[String, Any]], pipelineContext))
+        case l: List[_] => map ++ handleListParameter(l, Parameter(), pipelineContext).map(a => entry._1 -> a)
         case _ => map
       }
     })
   }
 
   private def containsSpecialCharacters(value: String): Boolean = {
-    "([!@$#])".r.findAllIn(value).nonEmpty
+    "([!@$#&?])".r.findAllIn(value).nonEmpty
   }
 
   @tailrec
@@ -207,7 +220,7 @@ trait PipelineStepMapper {
                            pipelineContext: PipelineContext): Option[Any] = {
     if (values.length > 0) {
       val bestValue = returnBestValue(values.head.trim, parameter, pipelineContext)
-      if (isValidOption(bestValue)) {
+      if (isValidOption(bestValue) && bestValue.get != None.orNull) {
         bestValue
       } else {
         getBestValue(values.slice(1, values.length), parameter, pipelineContext)
@@ -221,7 +234,7 @@ trait PipelineStepMapper {
   private def returnBestValue(value: String,
                               parameter: Parameter,
                               pipelineContext: PipelineContext): Option[Any] = {
-    val embeddedVariables = "([!@$#&]\\{.*?\\})".r.findAllIn(value).toList
+    val embeddedVariables = "([!@$#&?]\\{.*?\\})".r.findAllIn(value).toList
 
     if (embeddedVariables.nonEmpty) {
       embeddedVariables.foldLeft(Option[Any](value))((finalValue, embeddedValue) => {
@@ -252,7 +265,8 @@ trait PipelineStepMapper {
   private def processValue(parameter: Parameter, pipelineContext: PipelineContext, pipelinePath: PipelinePath) = {
     pipelinePath.mainValue match {
       case p if List('@', '#').contains(p.headOption.getOrElse("")) => getPipelineParameterValue(pipelinePath, pipelineContext)
-      case r if r.startsWith("$") => mapRuntimeParameter(pipelinePath, parameter, pipelineContext)
+      case r if r.startsWith("$") => mapRuntimeParameter(pipelinePath, parameter, recursive = false, pipelineContext)
+      case r if r.startsWith("?") => mapRuntimeParameter(pipelinePath, parameter, recursive = true, pipelineContext)
       case g if g.startsWith("!") => getGlobalParameterValue(g, pipelinePath.extraPath.getOrElse(""), pipelineContext)
       case g if g.startsWith("&") =>
         logger.debug(s"Fetching pipeline value for ${pipelinePath.mainValue.substring(1)}")
@@ -262,12 +276,13 @@ trait PipelineStepMapper {
     }
   }
 
-  private def mapRuntimeParameter(pipelinePath: PipelinePath, parameter: Parameter, pipelineContext: PipelineContext): Option[Any] = {
+  private def mapRuntimeParameter(pipelinePath: PipelinePath, parameter: Parameter, recursive: Boolean, pipelineContext: PipelineContext): Option[Any] = {
     val value = getPipelineParameterValue(pipelinePath, pipelineContext)
 
     if (value.isDefined) {
       value.get match {
-        case s: String => Some(mapParameter(parameter.copy(value = Some(s)), pipelineContext))
+        case s: String if recursive => Some(mapParameter(parameter.copy(value = Some(s)), pipelineContext))
+        case s: String => Some(s)
         case _ => value
       }
     } else {
@@ -276,7 +291,10 @@ trait PipelineStepMapper {
   }
 
   private def getPipelineParameterValue(pipelinePath: PipelinePath, pipelineContext: PipelineContext): Option[Any] = {
-    val paramName = pipelinePath.mainValue.substring(1)
+    val paramName = pipelinePath.mainValue.toLowerCase match {
+      case "@laststepid" | "#laststepid" => pipelineContext.getGlobalString("lastStepId").getOrElse("")
+      case _ => pipelinePath.mainValue.substring(1)
+    }
     // See if the paramName is a pipelineId
     val pipelineId = if (pipelinePath.pipelineId.isDefined) {
       pipelinePath.pipelineId.get
@@ -287,21 +305,28 @@ trait PipelineStepMapper {
     logger.debug(s"pulling parameter from Pipeline Parameters,paramName=$paramName,pipelineId=$pipelineId,parameters=$parameters")
     // the value is marked as a step parameter, get it from pipelineContext.parameters (Will be a PipelineStepResponse)
     if (parameters.get.parameters.contains(paramName)) {
+      val applyMethod = pipelineContext.getGlobalAs[Boolean]("extractMethodsEnabled")
       pipelinePath.mainValue.head match {
-        case '@' => getSpecificValue(parameters.get.parameters(paramName).asInstanceOf[PipelineStepResponse].primaryReturn, pipelinePath)
-        case '#' => getSpecificValue(parameters.get.parameters(paramName).asInstanceOf[PipelineStepResponse].namedReturns, pipelinePath)
-        case '$' => getSpecificValue(parameters.get.parameters(paramName), pipelinePath)
+        case '@' =>
+          getSpecificValue(parameters.get.parameters(paramName).asInstanceOf[PipelineStepResponse].primaryReturn,
+            pipelinePath, applyMethod)
+        case '#' =>
+          getSpecificValue(parameters.get.parameters(paramName).asInstanceOf[PipelineStepResponse].namedReturns,
+            pipelinePath, applyMethod)
+        case '$' => getSpecificValue(parameters.get.parameters(paramName), pipelinePath, applyMethod)
+        case '?' => getSpecificValue(parameters.get.parameters(paramName), pipelinePath, applyMethod)
       }
     } else {
       None
     }
   }
 
-  private def getSpecificValue(parentObject: Any, pipelinePath: PipelinePath): Option[Any] = {
+  private def getSpecificValue(parentObject: Any, pipelinePath: PipelinePath, applyMethod: Option[Boolean]): Option[Any] = {
     parentObject match {
-      case g: Option[_] if g.isDefined => Some(ReflectionUtils.extractField(g.get, pipelinePath.extraPath.getOrElse("")))
+      case g: Option[_] if g.isDefined =>
+        Some(ReflectionUtils.extractField(g.get, pipelinePath.extraPath.getOrElse(""), applyMethod = applyMethod))
       case _: Option[_] => None
-      case resp => Some(ReflectionUtils.extractField(resp, pipelinePath.extraPath.getOrElse("")))
+      case resp => Some(ReflectionUtils.extractField(resp, pipelinePath.extraPath.getOrElse(""), applyMethod = applyMethod))
     }
   }
 
@@ -327,7 +352,7 @@ trait PipelineStepMapper {
   }
 
   private def getSpecialCharacter(value: String): String = {
-    if (value.startsWith("@") || value.startsWith("$") || value.startsWith("!") || value.startsWith("#") || value.startsWith("&")) {
+    if (value.startsWith("@") || value.startsWith("$") || value.startsWith("!") || value.startsWith("#") || value.startsWith("&") || value.startsWith("?")) {
       value.substring(0, 1)
     } else {
       ""
@@ -346,12 +371,28 @@ trait PipelineStepMapper {
     // the value is marked as a global parameter, get it from pipelineContext.globals
     logger.debug(s"Fetching global value for $value.$extractPath")
     val globals = pipelineContext.globals.getOrElse(Map[String, Any]())
-    if (globals.contains(value.substring(1))) {
-      val global = globals(value.substring(1))
-      global match {
-        case g: Option[_] if g.isDefined => Some(ReflectionUtils.extractField(g.get, extractPath))
+    val applyMethod = pipelineContext.getGlobalAs[Boolean]("extractMethodsEnabled")
+    val flatGlobals = if(globals.contains("GlobalLinks")) {
+      // check for conflicting globals in Broadcast
+      val broadcast = globals("GlobalLinks").asInstanceOf[Map[String, String]].map(b => {
+        if(globals.contains(b._1)) {
+          logger.warn(s"duplicate global [${b._1}] found in GlobalLinks...using Broadcast global over root")
+        }
+        b._1 -> returnBestValue(b._2, Parameter(), pipelineContext.copy(globals=Some(globals - "GlobalLinks")))
+      })
+      globals ++ broadcast
+    } else { globals }
+
+    if (flatGlobals.contains(value.substring(1))) {
+      val global = flatGlobals(value.substring(1))
+      val ret = global match {
+        case g: Option[_] if g.isDefined => ReflectionUtils.extractField(g.get, extractPath, applyMethod = applyMethod)
         case _: Option[_] => None
-        case _ => Some(ReflectionUtils.extractField(global, extractPath))
+        case _ => ReflectionUtils.extractField(global, extractPath, applyMethod = applyMethod)
+      }
+      ret match {
+        case ret: Option[_] => ret
+        case _ => Some(ret)
       }
     } else {
       logger.debug(s"globals does not contain the requested value: $value.$extractPath")

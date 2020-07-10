@@ -4,6 +4,7 @@ import java.io.File
 import java.util.Date
 
 import com.acxiom.pipeline.applications.ApplicationUtils
+import com.acxiom.pipeline.audits.{AuditType, ExecutionAudit}
 import com.acxiom.pipeline.utils.DriverUtils
 import org.apache.commons.io.FileUtils
 import org.apache.log4j.{Level, Logger}
@@ -122,6 +123,7 @@ class PipelineDependencyExecutorTests extends FunSpec with BeforeAndAfterAll wit
     it("Should execute a multi-tiered chain of dependencies") {
       val results = new ListenerValidations
       val resultBuffer = mutable.ListBuffer[String]()
+      var audits = ExecutionAudit("NONE", AuditType.EXECUTION, Map(), System.currentTimeMillis())
       val listener = new PipelineListener {
         override def executionFinished(pipelines: List[Pipeline], pipelineContext: PipelineContext): Option[PipelineContext] = {
           var pipelineId = pipelineContext.getGlobalString("pipelineId").getOrElse("")
@@ -151,8 +153,14 @@ class PipelineDependencyExecutorTests extends FunSpec with BeforeAndAfterAll wit
             case "PipelineChain5" =>
               results.addValidation(s"Execution failed for $pipelineId",
                 getStringValue(pipelineContext, "PipelineChain5", "Pipeline1Step1") == "Chain5")
+            case "PipelineChain5a" =>
+              results.addValidation(s"Execution failed for $pipelineId",
+                getStringValue(pipelineContext, "PipelineChain5a", "Pipeline1Step1") == "Chain5a")
           }
           resultBuffer += pipelineId
+          if (pipelineContext.getGlobalString("executionId").getOrElse("") == "5") {
+            audits = pipelineContext.rootAudit
+          }
           None
         }
 
@@ -169,8 +177,14 @@ class PipelineDependencyExecutorTests extends FunSpec with BeforeAndAfterAll wit
       PipelineDependencyExecutor.executePlan(ApplicationUtils.createExecutionPlan(application, None, SparkTestHelper.sparkConf, listener))
       results.validate()
 
-      val validResults = List("Pipeline1", "PipelineChain1", "PipelineChain2", "PipelineChain3", "PipelineChain5", "Pipeline3")
+      val validResults = List("Pipeline1", "PipelineChain1", "PipelineChain2", "PipelineChain3", "PipelineChain5", "PipelineChain5a", "Pipeline3")
       assert(resultBuffer.diff(validResults).isEmpty)
+
+      assert(audits.children.isDefined && audits.children.get.length == 2)
+      assert(audits.children.get.head.children.isDefined)
+      assert(audits.children.get.head.children.get.head.metrics("funcMetric") == "Chain5")
+      assert(audits.children.get(1).children.isDefined)
+      assert(audits.children.get(1).children.get.head.metrics("funcMetric") == "Chain5a")
     }
 
     it("Should not execute child when one parent fails with an exception") {
@@ -278,6 +292,60 @@ class PipelineDependencyExecutorTests extends FunSpec with BeforeAndAfterAll wit
       val validResults = List("Pipeline1", "PipelineChain2", "PipelineChain3", "PipelineChain5")
       assert(resultBuffer.diff(validResults).isEmpty)
     }
+
+    it("Should handle GlobalLinks") {
+      val results = new ListenerValidations
+      val listener = new PipelineListener {
+        override def executionFinished(pipelines: List[Pipeline], pipelineContext: PipelineContext): Option[PipelineContext] = {
+          val pipelineId = pipelineContext.getGlobalString("pipelineId").getOrElse("")
+          pipelineId match {
+            case "Pipeline0" =>
+              // shared parameter is overridden with globallink
+              results.addValidation(s"Execution failed for shared GlobalLink in Pipeline0",
+                getStringValue(pipelineContext, "Pipeline0", "Pipeline0StepA") == "pipeline0_override")
+            case "Pipeline1" =>  // parent is 0
+              // shared parameter is overridden with globallink
+              results.addValidation(s"Execution failed for shared GlobalLink in Pipeline1",
+                getStringValue(pipelineContext, "Pipeline1", "Pipeline1StepA") == "pipeline1_override")
+              // able to access parent global link
+              results.addValidation(s"Execution failed for Pipeline0 GlobalLink on Pipeline1",
+                getStringValue(pipelineContext, "Pipeline1", "Pipeline1StepB") == "pipeline0_original")
+            case "Pipeline2" =>  // parent is 0
+              // not overriding shared global link, so it reverts to how the parent set it
+              results.addValidation(s"Execution failed for shared GlobalLink in Pipeline2",
+                getStringValue(pipelineContext, "Pipeline2", "Pipeline2StepA") == "pipeline0_override")
+              // able to access parent global link
+              results.addValidation(s"Execution failed for Pipeline0 GlobalLink on Pipeline2",
+                getStringValue(pipelineContext, "Pipeline2", "Pipeline2StepB") == "pipeline0_original")
+            case "Pipeline3" =>  // parent is 0, 1
+              // shared parameter is taken from 1 since it overrode 0
+              results.addValidation(s"Execution failed for shared GlobalLink in Pipeline3",
+                getStringValue(pipelineContext, "Pipeline3", "Pipeline3StepA") == "pipeline1_override")
+              // able to access grand-parent global link
+              results.addValidation(s"Execution failed for Pipeline0 GlobalLink on Pipeline3",
+                getStringValue(pipelineContext, "Pipeline3", "Pipeline3StepB") == "pipeline0_original")
+              // able to access parent global link
+              results.addValidation(s"Execution failed for Pipeline1 GlobalLink on Pipeline3",
+                getStringValue(pipelineContext, "Pipeline3", "Pipeline3StepC") == "pipeline1_original")
+            case "Pipeline4" =>  // parent is 0, 2
+              // shared parameter is overridden with global link
+              results.addValidation(s"Execution failed for shared GlobalLink in Pipeline4",
+                getStringValue(pipelineContext, "Pipeline4", "Pipeline4StepA") == "pipeline4_override")
+              // able to access grand-parent global link
+              results.addValidation(s"Execution failed for Pipeline0 GlobalLink on Pipeline4",
+                getStringValue(pipelineContext, "Pipeline4", "Pipeline4StepB") == "pipeline0_original")
+              // unable to access global link from pipeline1
+              results.addValidation(s"Execution failed for Pipeline1 GlobalLink on Pipeline4",
+                getStringValue(pipelineContext, "Pipeline4", "Pipeline4StepC") == "unknown")
+          }
+          None
+        }
+      }
+
+      val application = ApplicationUtils.parseApplication(Source.fromInputStream(getClass.getResourceAsStream("/global-links.json")).mkString)
+      PipelineDependencyExecutor.executePlan(ApplicationUtils.createExecutionPlan(application, None, SparkTestHelper.sparkConf, listener))
+      results.validate()
+    }
   }
 
   describe("Negative Tests") {
@@ -321,7 +389,7 @@ object ExecutionSteps {
   }
 
   def normalFunction(value: String, pipelineContext: PipelineContext): PipelineStepResponse = {
-    PipelineStepResponse(Some(value), Some(Map[String, Any]("time" -> new Date())))
+    PipelineStepResponse(Some(value), Some(Map[String, Any]("time" -> new Date(), "$metrics.funcMetric" -> value)))
   }
 
   def exceptionStep(value: String, pipelineContext: PipelineContext): PipelineStepResponse = {

@@ -15,6 +15,10 @@ object MockStepObject {
     default
   }
 
+  def mockStepFunctionWithDefaultValueNoOption(string: String, default: String = "default chicken"): String = {
+    default
+  }
+
   def mockStepWithListOfOptions(s: List[Option[String]]): String ={
     s.flatten.mkString(",")
   }
@@ -24,7 +28,7 @@ object MockStepObject {
   }
 
   def mockStepFunctionAnyResponse(string: String): String = {
-    string
+    s"string: $string"
   }
 
   def mockStepFunctionWithOptionalGenericParams(string: Option[String]): String ={
@@ -35,12 +39,21 @@ object MockStepObject {
     i
   }
 
+  def mockStepFunctionWithBoxClasses(i: Integer, l: java.lang.Long, d: java.lang.Double, f: java.lang.Float, c: Character,
+                                     by: java.lang.Byte, s: java.lang.Short): Int = {
+    i
+  }
+
   def mockStringListStepFunction(listSize: Int): PipelineStepResponse = {
     PipelineStepResponse(Some(List.tabulate(listSize)(_.toString)), None)
   }
 
   def mockExceptionStepFunction(string: String): PipelineStepResponse = {
     throw new IllegalArgumentException(s"exception thrown for string value ($string)")
+  }
+
+  def errorHandlingStep(ex: PipelineStepException): String = {
+    ex.message.getOrElse("")
   }
 
   def mockStepSetGlobal(string: String, globalName: String): PipelineStepResponse = {

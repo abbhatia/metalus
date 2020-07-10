@@ -60,12 +60,8 @@ object ReflectionUtils {
     logger.info(s"Preparing to run step $objName.$funcName")
     // Get the reflection information for the object and method
     val mirror = ru.runtimeMirror(getClass.getClassLoader)
-    val stepPackage = pipelineContext.stepPackages.get.find(pkg => {
-      Try(mirror.staticModule(s"$pkg.$objName")) match {
-        case Success(_) => true
-        case Failure(_) => false
-      }
-    })
+
+    val stepPackage = getStepPackage(objName, mirror, step.engineMeta.get.pkg, pipelineContext)
     val module = mirror.staticModule(s"${stepPackage.getOrElse("")}.$objName")
     val im = mirror.reflectModule(module)
     val method = getMethod(funcName, im, parameterValues)
@@ -75,7 +71,7 @@ object ReflectionUtils {
     val ts = stepObject.symbol.typeSignature
     // Get the parameters this method requires
     val parameters = method.paramLists.head
-    val validateTypes = pipelineContext.getGlobal("validateStepParameterTypes").getOrElse(false).asInstanceOf[Boolean]
+    val validateTypes = pipelineContext.getGlobalAs[Boolean]("validateStepParameterTypes").getOrElse(false)
     val params = mapMethodParameters(parameters, parameterValues, mirror, stepObject, funcName, ts, Some(pipelineContext), step.id, pipeline.id, validateTypes)
     logger.info(s"Executing step $objName.$funcName")
     logger.debug(s"Parameters: $params")
@@ -123,11 +119,11 @@ object ReflectionUtils {
    * @param extractFromOption Setting this to true will see if the value is an option and extract the sub value.
    * @return The value from the field or an empty string
    */
-  def extractField(entity: Any, fieldName: String, extractFromOption: Boolean = true): Any = {
+  def extractField(entity: Any, fieldName: String, extractFromOption: Boolean = true, applyMethod: Option[Boolean] = None): Any = {
     if (fieldName == "") {
       entity
     } else {
-      val value = getField(entity, fieldName)
+      val value = getField(entity, fieldName, applyMethod.getOrElse(false))
       if (extractFromOption) {
         value match {
           case option: Option[_] if option.isDefined => option.get
@@ -140,7 +136,7 @@ object ReflectionUtils {
   }
 
   @tailrec
-  private def getField(entity: Any, fieldName: String): Any = {
+  private def getField(entity: Any, fieldName: String, applyMethod: Boolean): Any = {
     val obj = entity match {
       case option: Option[_] if option.isDefined =>
         option.get
@@ -159,26 +155,31 @@ object ReflectionUtils {
 
     val value = obj match {
       case map: Map[_, _] => map.asInstanceOf[Map[String, Any]].getOrElse(name, None)
-      case _ => getFieldValue(obj, name)
+      case _ => getMemberValue(obj, name, applyMethod)
     }
 
     if (value != None && embedded) {
-      getField(value, fieldName.substring(fieldName.indexOf(".") + 1))
+      getField(value, fieldName.substring(fieldName.indexOf(".") + 1), applyMethod)
     } else {
       value
     }
   }
 
-  private def getFieldValue(obj: Any, fieldName: String): Any = {
+  private def getMemberValue(obj: Any, fieldName: String, applyMethod: Boolean): Any = {
     val mirror = ru.runtimeMirror(getClass.getClassLoader)
     val im = mirror.reflect(obj)
-    val term = im.symbol.typeSignature.member(ru.TermName(fieldName))
-    if (term.isTerm) {
-      val field = term.asTerm
-      val fieldVal = im.reflectField(field)
-      fieldVal.get
-    } else {
-      None
+    val symbol = im.symbol.typeSignature.member(ru.TermName(fieldName))
+    symbol match {
+      case method: MethodSymbol if applyMethod =>
+        val methodVal = im.reflectMethod(method)
+        methodVal.apply()
+      case method: MethodSymbol if !method.isAccessor =>
+        val reason = s"${method.name} is a method. To enable method extraction, set the global [extractMethodsEnabled] to true."
+        throw new IllegalArgumentException(s"Unable to extract: [${im.symbol.name}.${method.name}]. $reason")
+      case term: TermSymbol =>
+        val fieldVal = im.reflectField(term)
+        fieldVal.get
+      case _ => None
     }
   }
 
@@ -192,27 +193,17 @@ object ReflectionUtils {
       logger.debug(s"Mapping parameter $name")
       val optionType = param.asTerm.typeSignature.toString.startsWith("Option[") ||
         param.asTerm.typeSignature.toString.startsWith("scala.Option[")
-      val value = if (parameterValues.contains(name)) {
+      val paramValue = if (parameterValues.contains(name)) {
         parameterValues(name)
-      } else if (param.asTerm.isParamWithDefault) {
-        logger.debug("Mapping parameter from function default parameter value")
-        val term = ts.member(ru.TermName(s"$funcName$$default$$${pos + 1}"))
-        if (term != NoSymbol) {
-          // Locate the generated method that will provide the default value for this parameter
-          // Name follows Scala spec --> {functionName}$$default$${parameterPosition} + 1
-          val defaultGetterMethod = term.asMethod
-          // Execute the method to get the default value for this parameter
-          stepObject.reflectMethod(defaultGetterMethod)()
-        } else {
-          // This is probably a constructor default parameter, so it needs to be invoked differently
-          Class.forName(funcName.replaceAll("\\.<init>", ""))
-            .getMethod(s"$$lessinit$$greater$$default$$${pos + 1}").invoke(null)
-        }
-      } else {
-        logger.debug("Using built in pipeline variable")
-        getBuiltInParameter(pipelineContext, name)
+      } else { None }
+      val value = paramValue match {
+        case option: Option[Any] if option.isEmpty && param.asTerm.isParamWithDefault =>
+          getDefaultParameterValue(stepObject, funcName, ts, pos)
+        case option: Option[Any] if option.isEmpty =>
+          logger.debug("Using built in pipeline variable")
+          getBuiltInParameter(pipelineContext, name)
+        case _ => paramValue
       }
-
       val finalValue = if (pipelineContext.isDefined) {
         pipelineContext.get.security.secureParameter(getFinalValue(param.asTerm.typeSignature, value))
       } else {
@@ -233,9 +224,26 @@ object ReflectionUtils {
     }
   }
 
+  private def getDefaultParameterValue(stepObject: ru.InstanceMirror, funcName: String, ts: ru.Type, pos: Int) = {
+    logger.debug("Mapping parameter from function default parameter value")
+    val term = ts.member(ru.TermName(s"$funcName$$default$$${pos + 1}"))
+    if (term != NoSymbol) {
+      // Locate the generated method that will provide the default value for this parameter
+      // Name follows Scala spec --> {functionName}$$default$${parameterPosition} + 1
+      val defaultGetterMethod = term.asMethod
+      // Execute the method to get the default value for this parameter
+      stepObject.reflectMethod(defaultGetterMethod)()
+    } else {
+      // This is probably a constructor default parameter, so it needs to be invoked differently
+      Class.forName(funcName.replaceAll("\\.<init>", ""))
+        .getMethod(s"$$lessinit$$greater$$default$$${pos + 1}").invoke(null)
+    }
+  }
+
   private def getBuiltInParameter(pipelineContext: Option[PipelineContext], name: String) = {
     name match {
       case "pipelineContext" => if (pipelineContext.isDefined) pipelineContext.get
+      case _ => None
     }
   }
 
@@ -262,32 +270,37 @@ object ReflectionUtils {
     }
   }
 
+  //noinspection ScalaStyle
   private def isAssignableFrom(paramClass: Class[_], value: Any): Boolean = {
     value match {
-      case b: java.lang.Boolean => paramClass.isAssignableFrom(b.asInstanceOf[Boolean].getClass)
-      case i: java.lang.Integer => paramClass.isAssignableFrom(i.asInstanceOf[Int].getClass)
-      case l: java.lang.Long => paramClass.isAssignableFrom(l.asInstanceOf[Long].getClass)
-      case s: java.lang.Short => paramClass.isAssignableFrom(s.asInstanceOf[Short].getClass)
-      case c: java.lang.Character => paramClass.isAssignableFrom(c.asInstanceOf[Char].getClass)
-      case d: java.lang.Double => paramClass.isAssignableFrom(d.asInstanceOf[Double].getClass)
-      case f: java.lang.Float => paramClass.isAssignableFrom(f.asInstanceOf[Float].getClass)
-      case by: java.lang.Byte => paramClass.isAssignableFrom(by.asInstanceOf[Byte].getClass)
+      case b: java.lang.Boolean =>
+        paramClass.isAssignableFrom(b.getClass) || paramClass.isAssignableFrom(b.asInstanceOf[Boolean].getClass)
+      case i: java.lang.Integer =>
+        paramClass.isAssignableFrom(i.getClass) || paramClass.isAssignableFrom(i.asInstanceOf[Int].getClass)
+      case l: java.lang.Long =>
+        paramClass.isAssignableFrom(l.getClass) || paramClass.isAssignableFrom(l.asInstanceOf[Long].getClass)
+      case s: java.lang.Short =>
+        paramClass.isAssignableFrom(s.getClass) || paramClass.isAssignableFrom(s.asInstanceOf[Short].getClass)
+      case c: java.lang.Character =>
+        paramClass.isAssignableFrom(c.getClass) || paramClass.isAssignableFrom(c.asInstanceOf[Char].getClass)
+      case d: java.lang.Double =>
+        paramClass.isAssignableFrom(d.getClass) || paramClass.isAssignableFrom(d.asInstanceOf[Double].getClass)
+      case f: java.lang.Float =>
+        paramClass.isAssignableFrom(f.getClass) || paramClass.isAssignableFrom(f.asInstanceOf[Float].getClass)
+      case by: java.lang.Byte =>
+        paramClass.isAssignableFrom(by.getClass) || paramClass.isAssignableFrom(by.asInstanceOf[Byte].getClass)
       case _ => paramClass.isAssignableFrom(value.getClass)
     }
   }
 
   private def getFinalValue(paramType: ru.Type, value: Any): Any = {
     val optionType = paramType.toString.startsWith("Option[") || paramType.toString.startsWith("scala.Option[")
-    if (optionType && !value.isInstanceOf[Option[_]]) {
-      Some(wrapValueInCollection(paramType, optionType, value))
-    } else if (!optionType && value.isInstanceOf[Option[_]]) {
-      if (value.asInstanceOf[Option[_]].isDefined) {
-        wrapValueInCollection(paramType, optionType, value.asInstanceOf[Option[_]].get)
-      } else {
-        value
-      }
-    } else {
-      wrapValueInCollection(paramType, optionType, value)
+    (optionType, value) match {
+      case (_, v: Option[_]) if v.isEmpty => v
+      case (true, v) if !v.isInstanceOf[Option[_]] => Some(wrapValueInCollection(paramType, optionType, v))
+      case (false, v: Some[_]) => wrapValueInCollection(paramType, optionType, v.get)
+      case (true, v: Some[_]) => Some(wrapValueInCollection(paramType, optionType, v.get))
+      case (_, v) => wrapValueInCollection(paramType, optionType, v)
     }
   }
 
@@ -296,9 +309,9 @@ object ReflectionUtils {
     val typeName = if (isOption) paramType.typeArgs.head.toString else paramType.toString
     if (collectionType) {
       typeName match {
-        case t if t.startsWith("List[") && !value.isInstanceOf[List[_]] =>
+        case t if (t.startsWith("List[") || t.startsWith("scala.List[")) && !value.isInstanceOf[List[_]] =>
           List(value)
-        case t if t.startsWith("Seq[") && !value.isInstanceOf[Seq[_]] =>
+        case t if (t.startsWith("Seq[") || t.startsWith("scala.Seq[")) && !value.isInstanceOf[Seq[_]] =>
           Seq(value)
         case _ => value
       }
@@ -367,5 +380,19 @@ object ReflectionUtils {
     paramType.typeArgs.head <:< typeOf[Seq[_]]
   } else {
     paramType <:< typeOf[Seq[_]]
+  }
+
+  private def getStepPackage(objName: String, mirror: Mirror, pkg: Option[String], pipelineContext: PipelineContext): Option[String] = {
+    val stepPackages = pipelineContext.stepPackages.getOrElse(List())
+    if (pkg.isDefined && pkg.get.nonEmpty) {
+      pkg
+    } else {
+      stepPackages.find(pkg => {
+        Try(mirror.staticModule(s"$pkg.$objName")) match {
+          case Success(_) => true
+          case Failure(_) => false
+        }
+      })
+    }
   }
 }

@@ -249,9 +249,9 @@ class SparkSuiteTests extends FunSpec with BeforeAndAfterAll with GivenWhenThen 
       assert(updatedCtx.getGlobalString("two").isDefined)
       assert(updatedCtx.getGlobalString("two").get == "two")
       assert(updatedCtx.getGlobal("one").isDefined)
-      assert(updatedCtx.getGlobal("one").get.asInstanceOf[Int] == 1)
+      assert(updatedCtx.getGlobalAs[Int]("one").get == 1)
       assert(updatedCtx.getGlobal("three").isDefined)
-      assert(updatedCtx.getGlobal("three").get.asInstanceOf[Int] == 3)
+      assert(updatedCtx.getGlobalAs[Int]("three").get == 3)
       assert(updatedCtx.getGlobalString("one").isEmpty)
       assert(updatedCtx.getStepMessages.isEmpty)
     }
@@ -291,7 +291,7 @@ object SparkTestHelper {
           .split(",").toList
       }
       else {
-        List("com.acxiom.pipeline.steps", "com.acxiom.pipeline")
+        List("com.acxiom.pipeline", "com.acxiom.pipeline.steps")
       }),
       PipelineStepMapper(),
       Some(SparkTestHelper.pipelineListener),

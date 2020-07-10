@@ -1,6 +1,7 @@
 package com.acxiom.metalus
 
 import java.io.{File, FileWriter}
+import java.net.URI
 import java.util.jar.JarFile
 
 import com.acxiom.pipeline.api.HttpRestClient
@@ -14,10 +15,12 @@ object MetadataExtractor {
   def main(args: Array[String]): Unit = {
     val parameters = DriverUtils.extractParameters(args, Some(List("jar-files")))
     val jarFiles = parameters("jar-files").asInstanceOf[String].split(",").toList.map(file => new JarFile(new File(file)))
+    val credentialProvider = DriverUtils.getCredentialProvider(parameters)
     val output = if(parameters.contains("output-path")) {
       Output(None, Some(new File(parameters("output-path").asInstanceOf[String])))
     } else if(parameters.contains("api-url")) {
-      Output(Some(DriverUtils.getHttpRestClient(parameters("api-url").asInstanceOf[String], parameters)), None)
+      val apiPath = s"${parameters("api-url").asInstanceOf[String]}/${parameters.getOrElse("api-path", "/api/v1/").asInstanceOf[String]}"
+      Output(Some(DriverUtils.getHttpRestClient(new URI(apiPath).normalize().toString, credentialProvider)), None)
     } else {
       Output(None, None)
     }
@@ -35,7 +38,7 @@ object MetadataExtractor {
       .foreach(extractor => {
         val extract = ReflectionUtils.loadClass(extractor).asInstanceOf[Extractor]
         val metadata = extract.extractMetadata(jarFiles)
-        extract.writeOutputFile(metadata, output)
+        extract.writeOutput(metadata, output)
       })
   }
 }
@@ -63,7 +66,7 @@ trait Extractor {
     * @param metadata The metadata string to be written.
     * @param output Information about how to output the metadata.
     */
-  def writeOutputFile(metadata: Metadata, output: Output): Unit = {
+  def writeOutput(metadata: Metadata, output: Output): Unit = {
     if (output.path.nonEmpty) {
       val file = new File(output.path.get, s"${this.getMetaDataType}.json")
       val writer = new FileWriter(file)
@@ -72,7 +75,7 @@ trait Extractor {
       writer.close()
     }
     if (output.api.isDefined) {
-      output.api.get.postJsonContent(s"/api/v1/${this.getMetaDataType}", metadata.value)
+      output.api.get.postJsonContent(s"/${this.getMetaDataType}", metadata.value)
     }
     if (output.api.isEmpty && output.path.isEmpty) {
       print(metadata)

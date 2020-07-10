@@ -1,6 +1,7 @@
 package com.acxiom.pipeline.drivers
 
-import com.acxiom.pipeline.{Pipeline, PipelineContext, PipelineExecution}
+import com.acxiom.pipeline.utils.DriverUtils
+import com.acxiom.pipeline.{CredentialProvider, Pipeline, PipelineContext, PipelineExecution}
 import org.apache.log4j.{Level, Logger}
 
 trait DriverSetup {
@@ -10,6 +11,8 @@ trait DriverSetup {
   setLogLevel()
 
   private val deprecationSuggestion = "use executionPlan"
+
+  private lazy val provider = DriverUtils.getCredentialProvider(parameters)
 
   /**
     * Returns the list of pipelines to execute as part of this application.
@@ -26,6 +29,12 @@ trait DriverSetup {
   def refreshContext(pipelineContext: PipelineContext): PipelineContext = {
     pipelineContext
   }
+
+  /**
+    * Returns the CredentialProvider to use during for this job.
+    * @return The credential provider.
+    */
+  def credentialProvider: CredentialProvider = provider
 
   /**
     * This function will return the execution plan to be used for the driver.
@@ -59,6 +68,13 @@ trait DriverSetup {
     logger.info("Setting logging level")
     Logger.getRootLogger.setLevel(getLogLevel(parameters.getOrElse("rootLogLevel", "WARN").asInstanceOf[String]))
     Logger.getLogger("com.acxiom").setLevel(getLogLevel(parameters.getOrElse("logLevel", "INFO").asInstanceOf[String]))
+    if (parameters.contains("customLogLevels") && parameters("customLogLevels").toString.trim.nonEmpty) {
+      val customLogLevels = parameters("customLogLevels").asInstanceOf[String]
+      customLogLevels.split(",").foreach(level => {
+        val logParams = level.split(":")
+        Logger.getLogger(logParams.head).setLevel(getLogLevel(logParams(1)))
+      })
+    }
   }
 
   private def getLogLevel(level: String): Level = {

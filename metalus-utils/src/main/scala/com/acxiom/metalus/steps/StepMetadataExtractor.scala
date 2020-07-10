@@ -10,7 +10,10 @@ import org.json4s.native.Serialization
 import org.json4s.{DefaultFormats, Formats}
 
 import scala.collection.JavaConversions._
+import scala.reflect.ScalaSignature
+import scala.reflect.internal.pickling.ByteCodecs
 import scala.reflect.runtime.{universe => ru}
+import scala.tools.scalap.scalax.rules.scalasig.{ByteCode, ScalaSigAttributeParsers}
 import scala.util.{Failure, Success, Try}
 
 class StepMetadataExtractor extends Extractor {
@@ -22,7 +25,7 @@ class StepMetadataExtractor extends Extractor {
     val stepMappings = jarFiles.foldLeft((List[StepDefinition](), Set[String]()))((stepDefinitions, file) => {
       file.entries().toList.filter(f => f.getName.endsWith(".class")).foldLeft(stepDefinitions)((definitions, cf) => {
         val stepPath = s"${cf.getName.substring(0, cf.getName.indexOf(".")).replaceAll("/", "\\.")}"
-        if (!stepPath.contains("$")) {
+        if (!stepPath.contains("$") && isStepObject(stepPath)) {
           val stepsAndClasses = findStepDefinitions(stepPath, file.getName.substring(file.getName.lastIndexOf('/') + 1))
           val steps = if (stepsAndClasses.nonEmpty) Some(stepsAndClasses.get._1) else None
           val classes = if (stepsAndClasses.nonEmpty) Some(stepsAndClasses.get._2) else None
@@ -48,16 +51,47 @@ class StepMetadataExtractor extends Extractor {
     * @param metadata The metadata string to be written.
     * @param output   Information about how to output the metadata.
     */
-  override def writeOutputFile(metadata: Metadata, output: Output): Unit = {
+  override def writeOutput(metadata: Metadata, output: Output): Unit = {
     if (output.api.isDefined) {
       val http = output.api.get
       val definition = metadata.asInstanceOf[StepMetadata]
-      if (http.exists("/api/v1/package-objects")) {
-        http.postJsonContent("/api/v1/package-objects", Serialization.write(definition.pkgObjs))
+      if (http.exists("package-objects")) {
+        definition.pkgObjs.foreach(pkg => {
+          if (http.exists(s"package-objects/${pkg.id}")) {
+            http.putJsonContent(s"package-objects/${pkg.id}", Serialization.write(pkg))
+          } else {
+            http.postJsonContent("package-objects", Serialization.write(pkg))
+          }
+        })
       }
-      http.postJsonContent("/api/v1/steps", Serialization.write(definition.steps))
+      definition.steps.foreach(step => {
+        val jarList = step.tags.filter(_.endsWith(".jar")).mkString
+        val headers =
+          Some(Map[String, String]("User-Agent" -> s"Metalus / ${System.getProperty("user.name")} / $jarList"))
+        if (http.getContentLength(s"steps/${step.id}") > 0) {
+          http.putJsonContent(s"steps/${step.id}", Serialization.write(step), headers)
+        } else {
+          http.postJsonContent("steps", Serialization.write(step), headers)
+        }
+      })
     } else {
-      super.writeOutputFile(metadata, output)
+      super.writeOutput(metadata, output)
+    }
+  }
+
+  private def isStepObject(stepPath: String): Boolean = {
+    val clazz = Class.forName(stepPath, false, getClass.getClassLoader)
+    val containsAnnotation = clazz.isAnnotationPresent(classOf[scala.reflect.ScalaSignature])
+    // Iterate the annotations in case there are multiple
+    if (containsAnnotation) {
+      clazz.getAnnotationsByType(classOf[ScalaSignature]).exists(annotation => {
+        val bytes = annotation.bytes.getBytes("UTF-8")
+        val len = ByteCodecs.decode(bytes)
+        val byteCode = Some(ByteCode(bytes.take(len)))
+        byteCode.map(ScalaSigAttributeParsers.parse).get.symbols.exists(s => s.name == "StepObject")
+      })
+    } else {
+      false
     }
   }
 
@@ -109,9 +143,9 @@ class StepMetadataExtractor extends Extractor {
     Try(mirror.staticModule(stepObjectPath)) match {
       case Success(_) =>
         val module = mirror.staticModule(stepObjectPath)
-        val im = mirror.reflectModule(module)
-        val annotation = im.symbol.annotations.find(_.tree.tpe =:= ru.typeOf[StepObject])
+        val annotation = module.annotations.find(_.tree.tpe =:= ru.typeOf[StepObject])
         if (annotation.isDefined) {
+          val im = mirror.reflectModule(module)
           Some(im.symbol.info.decls.foldLeft((List[StepDefinition](), Set[String]()))((stepsAndClasses, symbol) => {
             val ann = symbol.annotations.find(_.tree.tpe =:= ru.typeOf[StepFunction])
             generateStepDefinitionList(im, stepsAndClasses._1, stepsAndClasses._2, symbol, ann, packageName, jarName)

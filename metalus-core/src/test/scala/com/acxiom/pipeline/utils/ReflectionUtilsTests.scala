@@ -1,17 +1,51 @@
 package com.acxiom.pipeline.utils
 
+import java.io.File
 import java.util
 
 import com.acxiom.pipeline.{PipelineStepResponse, _}
-import org.scalatest.FunSpec
+import org.apache.commons.io.FileUtils
+import org.apache.log4j.{Level, Logger}
+import org.apache.spark.SparkConf
+import org.apache.spark.sql.SparkSession
+import org.scalatest.{BeforeAndAfterAll, FunSpec}
 
-class ReflectionUtilsTests extends FunSpec {
+class ReflectionUtilsTests extends FunSpec with BeforeAndAfterAll {
   private val FIVE = 5
+
+  override def beforeAll() {
+    Logger.getLogger("org.apache.spark").setLevel(Level.WARN)
+    Logger.getLogger("org.apache.hadoop").setLevel(Level.WARN)
+    Logger.getLogger("com.acxiom.pipeline").setLevel(Level.DEBUG)
+    SparkTestHelper.sparkConf = new SparkConf()
+      .setMaster(SparkTestHelper.MASTER)
+      .setAppName(SparkTestHelper.APPNAME)
+    SparkTestHelper.sparkConf.set("spark.hadoop.io.compression.codecs",
+      ",org.apache.hadoop.io.compress.BZip2Codec,org.apache.hadoop.io.compress.DeflateCodec," +
+        "org.apache.hadoop.io.compress.GzipCodec,org.apache." +
+        "hadoop.io.compress.Lz4Codec,org.apache.hadoop.io.compress.SnappyCodec")
+
+    SparkTestHelper.sparkSession = SparkSession.builder().config(SparkTestHelper.sparkConf).getOrCreate()
+
+    // cleanup spark-warehouse and user-warehouse directories
+    FileUtils.deleteDirectory(new File("spark-warehouse"))
+    FileUtils.deleteDirectory(new File("user-warehouse"))
+  }
+
+  override def afterAll() {
+    SparkTestHelper.sparkSession.stop()
+    Logger.getRootLogger.setLevel(Level.INFO)
+
+    // cleanup spark-warehouse and user-warehouse directories
+    FileUtils.deleteDirectory(new File("spark-warehouse"))
+    FileUtils.deleteDirectory(new File("user-warehouse"))
+  }
+
   describe("ReflectionUtil - processStep") {
     val pipeline = Pipeline(Some("TestPipeline"))
     val globals = Map[String, Any]("validateStepParameterTypes" -> true)
     val pipelineContext = PipelineContext(None, None, Some(globals), PipelineSecurityManager(), PipelineParameters(),
-      Some(List("com.acxiom.pipeline.steps", "com.acxiom.pipeline")), PipelineStepMapper(), None, None)
+      Some(List("com.acxiom.pipeline", "com.acxiom.pipeline.steps")), PipelineStepMapper(), None, None)
     it("Should process step function") {
       val step = PipelineStep(None, None, None, None, None, Some(EngineMeta(Some("MockStepObject.mockStepFunction"))))
       val response = ReflectionUtils.processStep(step, pipeline,
@@ -25,7 +59,7 @@ class ReflectionUtilsTests extends FunSpec {
 
     it("Should process step function with non-PipelineStepResponse") {
       val step = PipelineStep(None, None, None, None, None,
-        Some(EngineMeta(Some("MockStepObject.mockStepFunctionAnyResponse"))))
+        Some(EngineMeta(Some("MockStepObject.mockStepFunctionAnyResponse"), Some("com.acxiom.pipeline.steps"))))
       val response = ReflectionUtils.processStep(step, pipeline, Map[String, Any]("string" -> "string"), pipelineContext)
       assert(response.isInstanceOf[PipelineStepResponse])
       assert(response.asInstanceOf[PipelineStepResponse].primaryReturn.isDefined)
@@ -56,6 +90,16 @@ class ReflectionUtilsTests extends FunSpec {
       assert(response.asInstanceOf[PipelineStepResponse].primaryReturn.get == "chicken")
     }
 
+    it("Should process step with default value no option") {
+      val step = PipelineStep(None, None, None, None, None,
+        Some(EngineMeta(Some("MockStepObject.mockStepFunctionWithDefaultValueNoOption"))))
+      val response = ReflectionUtils.processStep(step, pipeline,
+        Map[String, Any]("string" -> "string", "default" -> None), pipelineContext)
+      assert(response.isInstanceOf[PipelineStepResponse])
+      assert(response.asInstanceOf[PipelineStepResponse].primaryReturn.isDefined)
+      assert(response.asInstanceOf[PipelineStepResponse].primaryReturn.get == "default chicken")
+    }
+
     it("Should wrap values in a List, Seq, or Array if passing a single element to a collection") {
       val step = PipelineStep(None, None, None, None, None,
         Some(EngineMeta(Some("MockStepObject.mockStepFunctionWithListParams"))))
@@ -64,6 +108,19 @@ class ReflectionUtilsTests extends FunSpec {
       assert(response.isInstanceOf[PipelineStepResponse])
       assert(response.asInstanceOf[PipelineStepResponse].primaryReturn.isDefined)
       assert(response.asInstanceOf[PipelineStepResponse].primaryReturn.get == "Some(l1),Some(1),None")
+    }
+
+    it("Should handle scala.List prefix") {
+      val ret = ReflectionUtils.loadClass("com.acxiom.pipeline.utils.ClassWithOptionList", Some(Map[String, Any](
+        "list" -> "moo",
+        "optionList" -> Some(List[String]()),
+        "optionList2" -> List[String]("moo2")
+      )))
+      assert(ret.isInstanceOf[ClassWithOptionList])
+      val opList = ret.asInstanceOf[ClassWithOptionList]
+      assert(opList.optionList.isDefined)
+      assert(opList.list.headOption.contains("moo"))
+      assert(opList.optionList2.getOrElse(List()).headOption.contains("moo2"))
     }
 
     it("Should unwrap an option passed to a non option param"){
@@ -123,6 +180,42 @@ class ReflectionUtilsTests extends FunSpec {
       assert(response.asInstanceOf[PipelineStepResponse].primaryReturn.isDefined)
       assert(response.asInstanceOf[PipelineStepResponse].primaryReturn.get == 1)
     }
+
+    it("should handle Boxed types") {
+      val step = PipelineStep(None, None, None, None, None,
+        Some(EngineMeta(Some("MockStepObject.mockStepFunctionWithBoxClasses"))))
+      val map = Map[String, Any]("i" -> "1".toInt,
+        "l" -> 1L,
+        "s" -> 1.toShort.asInstanceOf[java.lang.Short],
+        "d" -> 1.0D,
+        "f" -> 1.0F,
+        "c" -> '1',
+        "by" -> 1.toByte.asInstanceOf[java.lang.Byte],
+        "a" -> "anyValue"
+      )
+      val response = ReflectionUtils.processStep(step, pipeline, map, pipelineContext)
+      assert(response.isInstanceOf[PipelineStepResponse])
+      assert(response.asInstanceOf[PipelineStepResponse].primaryReturn.isDefined)
+      assert(response.asInstanceOf[PipelineStepResponse].primaryReturn.get == 1)
+    }
+
+    it("Should respect the pkg setting on EngineMeta") {
+      val step = PipelineStep(None, None, None, None, None,
+        Some(EngineMeta(Some("MockStepObject.mockStepFunctionAnyResponse"), Some("com.acxiom.pipeline.steps"))))
+      val response = ReflectionUtils.processStep(step, pipeline, Map[String, Any]("string" -> "string"), pipelineContext)
+      assert(response.isInstanceOf[PipelineStepResponse])
+      assert(response.asInstanceOf[PipelineStepResponse].primaryReturn.isDefined)
+      assert(response.asInstanceOf[PipelineStepResponse].primaryReturn.getOrElse("") == "string")
+    }
+
+    it("Should inject None for missing parameters") {
+      val step = PipelineStep(None, None, None, None, None,
+        Some(EngineMeta(Some("MockStepObject.mockStepFunctionWithOptionalGenericParams"))))
+      val response = ReflectionUtils.processStep(step, pipeline, Map[String, Any](), pipelineContext)
+      assert(response.isInstanceOf[PipelineStepResponse])
+      assert(response.asInstanceOf[PipelineStepResponse].primaryReturn.isDefined)
+      assert(response.asInstanceOf[PipelineStepResponse].primaryReturn.getOrElse("") == "chicken")
+    }
   }
 
   describe("ReflectionUtils - loadClass") {
@@ -181,6 +274,22 @@ class ReflectionUtilsTests extends FunSpec {
       assert(ReflectionUtils.extractField(MockObject("string", FIVE), "bob").asInstanceOf[Option[_]].isEmpty)
     }
 
+    it("Should execute methods without parameters") {
+      val spark = SparkTestHelper.sparkSession
+      import spark.implicits._
+      val df = Seq((1, "silkie"), (2, "polish"), (3, "buttercup")).toDF("id", "chicken")
+      assert(ReflectionUtils.extractField(df, "count", applyMethod = Some(true)) == 3)
+    }
+
+    it("Should fail on methods if method extraction is disabled") {
+      val thrown = intercept[IllegalArgumentException] {
+        ReflectionUtils.extractField(List(), "isEmpty")
+      }
+      val expected = "Unable to extract: [Nil.isEmpty]. isEmpty is a method." +
+        " To enable method extraction, set the global [extractMethodsEnabled] to true."
+      assert(thrown.getMessage == expected)
+    }
+
     it("Should return None when entity is None") {
       assert(ReflectionUtils.extractField(None, "something").asInstanceOf[Option[_]].isEmpty)
     }
@@ -195,3 +304,5 @@ class ReflectionUtilsTests extends FunSpec {
 
 case class MockParent(mock: MockObject)
 case class MockObject(string: String, num: Int, opt: Option[String] = None)
+class ClassWithOptionList(val list: List[String], val optionList: Option[scala.List[Any]], val optionList2: Option[scala.List[Any]]) {
+}

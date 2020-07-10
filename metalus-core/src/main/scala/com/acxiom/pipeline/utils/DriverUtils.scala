@@ -1,12 +1,14 @@
 package com.acxiom.pipeline.utils
 
-import com.acxiom.pipeline.api.{Authorization, HttpRestClient}
+import com.acxiom.pipeline.api.HttpRestClient
+import com.acxiom.pipeline.drivers.StreamingDataParser
 import com.acxiom.pipeline.fs.FileManager
-import com.acxiom.pipeline.{DefaultPipeline, Pipeline, PipelineExecution}
+import com.acxiom.pipeline._
 import org.apache.hadoop.io.LongWritable
 import org.apache.http.client.entity.UrlEncodedFormEntity
 import org.apache.log4j.Logger
 import org.apache.spark.SparkConf
+import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.DataFrame
 import org.json4s.native.JsonMethods.parse
 import org.json4s.reflect.Reflector
@@ -78,18 +80,30 @@ object DriverUtils {
     parameters
   }
 
-  def getHttpRestClient(url: String, parameters: Map[String, Any]): HttpRestClient = {
-    val authorizationClass = "authorization.class"
-    if (parameters.contains(authorizationClass)) {
-      val authorizationParameters = parameters.filter(entry =>
-        entry._1.startsWith("authorization.") && entry._1 != authorizationClass)
-        .map(entry => entry._1.substring("authorization.".length) -> entry._2)
-      HttpRestClient(url,
-        ReflectionUtils.loadClass(parameters(authorizationClass).asInstanceOf[String], Some(authorizationParameters))
-          .asInstanceOf[Authorization])
+  /**
+    * Create an HttpRestClient.
+    * @param url The base URL
+    * @param credentialProvider The credential provider to use for auth
+    * @param skipAuth Flag allowing auth to be skipped
+    * @return An HttpRestClient
+    */
+  def getHttpRestClient(url: String, credentialProvider: CredentialProvider, skipAuth: Option[Boolean] = None): HttpRestClient = {
+    val credential = credentialProvider.getNamedCredential("DefaultAuthorization")
+    if (credential.isDefined && !skipAuth.getOrElse(false)) {
+      HttpRestClient(url, credential.get.asInstanceOf[AuthorizationCredential].authorization)
     } else {
       HttpRestClient(url)
     }
+  }
+
+  /**
+    * Given a map of parameters, create the CredentialProvider
+    * @param parameters The map of parameters to pass to the constructor of the CredentialProvider
+    * @return A CredentialProvider
+    */
+  def getCredentialProvider(parameters: Map[String, Any]): CredentialProvider = {
+    val providerClass = parameters.getOrElse("credential-provider", "com.acxiom.pipeline.DefaultCredentialProvider").asInstanceOf[String]
+    ReflectionUtils.loadClass(providerClass, Some(Map("parameters" -> parameters))).asInstanceOf[CredentialProvider]
   }
 
   /**
@@ -153,6 +167,38 @@ object DriverUtils {
       execution.parents))
   }
 
+  /**
+    * Helper function to parse and initialize the StreamingParsers from the command line.
+    * @param parameters The input parameters
+    * @param parsers An initial list of parsers. The new parsers will be prepended to this list.
+    * @return A list of streaming parsers
+    */
+  def generateStreamingDataParsers[T](parameters: Map[String, Any],
+                                   parsers: Option[List[StreamingDataParser[T]]] = None): List[StreamingDataParser[T]] = {
+    val parsersList = if (parsers.isDefined) {
+      parsers.get
+    } else {
+      List[StreamingDataParser[T]]()
+    }
+    // Add any parsers to the head of the list
+    if (parameters.contains("streaming-parsers")) {
+      parameters("streaming-parsers").asInstanceOf[String].split(',').foldLeft(parsersList)((list, p) => {
+        ReflectionUtils.loadClass(p, Some(parameters)).asInstanceOf[StreamingDataParser[T]] :: list
+      })
+    } else {
+      parsersList
+    }
+  }
+
+  /**
+    * Helper function that will attempt to find the appropriate parse for the provided RDD.
+    * @param rdd The RDD to parse.
+    * @param parsers A list of parsers tp consider.
+    * @return The first parser that indicates it can parse the RDD.
+    */
+  def getStreamingParser[T](rdd: RDD[T], parsers: List[StreamingDataParser[T]]): Option[StreamingDataParser[T]] =
+    parsers.find(p => p.canParse(rdd))
+
   def loadJsonFromFile(path: String,
                        fileLoaderClassName: String = "com.acxiom.pipeline.fs.LocalFileManager",
                        parameters: Map[String, Any] = Map[String, Any]()): String = {
@@ -167,7 +213,7 @@ object DriverUtils {
     } else {
       tempConf
     }
-    val fileManager = ReflectionUtils.loadClass(fileLoaderClassName, Some(Map("conf" -> sparkConf))).asInstanceOf[FileManager]
+    val fileManager = ReflectionUtils.loadClass(fileLoaderClassName, Some(parameters + ("conf" -> sparkConf))).asInstanceOf[FileManager]
     val json = Source.fromInputStream(fileManager.getInputStream(path)).mkString
     json
   }
